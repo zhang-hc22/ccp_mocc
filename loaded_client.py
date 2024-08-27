@@ -16,7 +16,8 @@
 # import os
 import random
 import sys
-import pyportus as portus
+import socket
+import json
 
 # currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 # parentdir = os.path.dirname(currentdir)
@@ -55,27 +56,49 @@ for arg in sys.argv:
         RESET_RATE_MIN = float(arg_str)
         RESET_RATE_MAX = float(arg_str)
 
+def apply_rate_delta(rate, rate_delta):
+    global MIN_RATE
+    global MAX_RATE
+    global DELTA_SCALE
+    
+    rate_delta *= DELTA_SCALE
+
+    # We want a string of actions with average 0 to result in a rate change
+    # of 0, so delta of 0.05 means rate * 1.05,
+    # delta of -0.05 means rate / 1.05
+    if rate_delta > 0:
+        rate *= (1.0 + rate_delta)
+    elif rate_delta < 0:
+        rate /= (1.0 - rate_delta)
+    
+    # For practical purposes, we may have maximum and minimum rates allowed.
+    if rate < MIN_RATE:
+        rate = MIN_RATE
+    if rate > MAX_RATE:
+        rate = MAX_RATE
+
+    return rate
+
 class PccGymDriver():
     
     flow_lookup = {}
     
-    def __init__(self, flow_id, datapath, datapath_info):
+    def __init__(self, flow_id):
         global RESET_RATE_MIN
         global RESET_RATE_MAX
 
         self.id = flow_id
-        
-        self.datapath = datapath
-        self.datapath_info = datapath_info
 
         self.rate = random.uniform(RESET_RATE_MIN, RESET_RATE_MAX)
         
-        self.datapath.set_program("default", [("Rate", self.rate * 1e6)])
         self.start_flow_time = time.time()
         self.send_start_time = self.start_flow_time
         self.recv_start_time = self.start_flow_time
         self.recv_end_time = self.start_flow_time
-        self.first_acked = true
+        self.first_acked = True
+        self.first_ack_latency_sec = 0
+        self.last_ack_latency_sec = 0
+        self.last_call = time.time()
         
         self.history_len = arg_or_default("--history-len", 10)
         self.features = arg_or_default("--input-features",
@@ -85,7 +108,6 @@ class PccGymDriver():
         self.history = sender_obs.SenderHistory(self.history_len,
                                                 self.features,
                                                 self.id)
-        self.got_data = False
 
         self.weights = arg_or_default("--weight_throughput", 0.6), arg_or_default("--weight_delay", 0.3), arg_or_default("--weight_loss", 0.1)
 
@@ -94,13 +116,9 @@ class PccGymDriver():
         PccGymDriver.flow_lookup[flow_id] = self
 
     def get_rate(self):
-        if self.has_data():
-            rate_delta = self.agent.act(self.history.as_array())
-            self.rate = apply_rate_delta(self.rate, rate_delta)
+        rate_delta = self.agent.act(self.history.as_array())
+        self.rate = apply_rate_delta(self.rate, rate_delta)
         return self.rate * 1e6
-
-    def has_data(self):
-        return self.got_data
 
     def set_current_rate(self, new_rate):
         self.current_rate = new_rate
@@ -108,20 +126,6 @@ class PccGymDriver():
     def record_observation(self, new_mi):
         self.history.step(new_mi)
         self.got_data = True
-
-    def reset_rate(self):
-        self.current_rate = random.uniform(RESET_RATE_MIN, RESET_RATE_MAX)
-
-    def reset_history(self):
-        self.history = sender_obs.SenderHistory(self.history_len,
-                                                self.features,
-                                                self.id)
-        self.got_data = False
-
-    def reset(self):
-        self.agent.reset()
-        self.reset_rate()
-        self.reset_history()
 
     def give_sample(self, bytes_sent, bytes_acked, bytes_lost,
                     send_start_time, send_end_time, recv_start_time,
@@ -145,102 +149,80 @@ class PccGymDriver():
         return PccGymDriver.flow_lookup[flow_id]
     
     def on_report(self, r):
-        if r.finish_interval:
-            bytes_lost = self.datapath_info.mss * r.packets_lost
-            bytes_sent = r.bytes_acked + r.bytes_sacked + r.bytes_lost + r.bytes_in_flight
-            packets_sent = r.packets_in_flight + r.packets_acked + r.packets_lost
-            utility = r.bytes_acked * 8 / (self.recv_end_time - self.recv_start_time)
-            self.give_sample(bytes_sent, r.bytes_acked, r.bytes_lost, self.send_start_time - self.start_flow_time, time.time() - self.start_flow_time, self.recv_start_time - self.start_flow_time, self.recv_end_time - self.start_flow_time, r.rtt_samples / 1000000, packets_sent, utility)
+        # 处理收到的数据
+        recent_call = time.time()
+        print("last call: ", self.last_call)
+        print("recent call: ", recent_call)
+        print("call interval: ", int((recent_call - self.last_call) * 1000000))
+        self.last_call = recent_call
+        print("inflight: ", r['bytes_in_flight'])
+        print("bytes_acked: ", r['bytes_acked'])
+        print("packets_lost: ", r['packets_lost'])
+        print("bytes_sacked: ", r['bytes_sacked'])
+        print("rtt_samples: ", r['rtt_samples'])
+        print("finish_interval: ", r['finish_interval'])
+
+        if int(r['finish_interval']) == 1:
+            print('update rate')
+            bytes_lost = self.datapath_info.mss * r['packets_lost']
+            bytes_sent = r['bytes_acked'] + r['bytes_sacked'] + bytes_lost + r['bytes_in_flight']
+            utility = 0.0
+            if self.recv_end_time == self.recv_start_time:
+                self.recv_end_time = time.time()
+            rtt_samples = [self.first_ack_latency_sec, self.last_ack_latency_sec]
+            self.give_sample(bytes_sent, r['bytes_acked'], bytes_lost, self.send_start_time - self.start_flow_time, time.time() - self.start_flow_time, self.recv_start_time - self.start_flow_time, self.recv_end_time - self.start_flow_time, rtt_samples, self.datapath_info.mss, utility)
             updated_rate = self.get_rate()
             self.send_start_time = time.time()
-            self.datapath.update_field("Rate", updated_rate)
+            self.first_acked = True
+            print('update rate to', updated_rate)
+            print("---------------------------")
+            return updated_rate
         
         else:
+            print('ack received')
             if self.first_acked:
-                recv_start_time = time.time()
-                recv_end_time = recv_start_time
+                self.recv_start_time = time.time()
+                self.recv_end_time = self.recv_start_time
                 self.first_acked = False
+                self.first_ack_latency_sec = r['rtt_samples'] / 1000000
+                self.last_ack_latency_sec = self.first_ack_latency_sec
             else:
-                recv_end_time = time.time()
+                self.recv_end_time = time.time()
+                self.last_ack_latency_sec = r['rtt_samples'] / 1000000
+                print('update recv_end_time')
+            return None
+
+def main():
+    # 创建并绑定Unix域套接字
+    server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_socket.bind("/tmp/uds_socket")
+    server_socket.listen(1)
+    
+    print("Server is listening...")
+    
+    driver = PccGymDriver(0)
+
+    while True:
+        # 等待连接
+        conn, _ = server_socket.accept()
+        with conn:
+            print("Connected to a client.")
+            data = conn.recv(1024)
+            if not data:
+                break
+            
+            # 将JSON字符串解析为Python字典
+            r = json.loads(data.decode('utf-8'))
+            
+            # 处理接收到的数据并获取返回值
+            result = driver.on_report(r)
+            
+            # 如果有返回值，将其发送回Rust进程
+            if result is not None:
+                response = json.dumps({"updated_rate": result})
+                conn.sendall(response.encode('utf-8'))
         
-class MOCC(portus.AlgBase):
-    def datapath_programs(self):
-        return {
-                "default" : """\
-                (def 
-                    (Report
-                        (volatile bytes_in_flight 0)
-                        (bytes_acked 0)
-                        (bytes_sacked 0)
-                        (volatile packets_lost 0)
-                        (packets_acked 0)
-                        (volatile packets_in_flight 0)
-                        (finish_interval false)
-                        (volatile rtt_samples 0)
-                    )
-                )
-                (when true
-                    (:= Report.bytes_in_flight Flow.bytes_in_flight)
-                    (:= Report.bytes_acked (+ Report.bytes_acked Ack.bytes_acked))
-                    (:= Report.bytes_sacked (+ Report.bytes_sacked Ack.packets_misordered))
-                    (:= Report.packets_lost Ack.lost_pkts_sample)
-                    (:= Report.packets_acked (+ Report.packets_acked Ack.packets_acked))
-                    (:= Report.packets_in_flight Flow.packets_in_flight)
-                    (:= Report.rtt_samples Flow.rtt_sample_us)
-                    (report)
-                    (fallthrough)
-                )
-                (when (> Micros Flow.rtt_sample_us)
-                    (:= Report.finish_interval true)
-                    (report)
-                    (:= Report.finish_interval false)
-                    (:= Micros 0)
-                )
-            """
-        }
+    print("Connection closed.")
 
-
-def give_sample(flow_id, bytes_sent, bytes_acked, bytes_lost,
-                send_start_time, send_end_time, recv_start_time,
-                recv_end_time, rtt_samples, packet_size, utility):
-    driver = PccGymDriver.get_by_flow_id(flow_id)
-    driver.give_sample(bytes_sent, bytes_acked, bytes_lost,
-                       send_start_time, send_end_time, recv_start_time,
-                       recv_end_time, rtt_samples, packet_size, utility)
-
-def apply_rate_delta(rate, rate_delta):
-    global MIN_RATE
-    global MAX_RATE
-    global DELTA_SCALE
-    
-    rate_delta *= DELTA_SCALE
-
-    # We want a string of actions with average 0 to result in a rate change
-    # of 0, so delta of 0.05 means rate * 1.05,
-    # delta of -0.05 means rate / 1.05
-    if rate_delta > 0:
-        rate *= (1.0 + rate_delta)
-    elif rate_delta < 0:
-        rate /= (1.0 - rate_delta)
-    
-    # For practical purposes, we may have maximum and minimum rates allowed.
-    if rate < MIN_RATE:
-        rate = MIN_RATE
-    if rate > MAX_RATE:
-        rate = MAX_RATE
-
-    return rate
-    
-def reset(flow_id):
-    driver = PccGymDriver.get_by_flow_id(flow_id)
-    driver.reset()
-
-def get_rate(flow_id):
-    #print("Getting rate")
-    driver = PccGymDriver.get_by_flow_id(flow_id)
-    return driver.get_rate()
-
-def init(flow_id):
-    driver = PccGymDriver(flow_id)
-
-
+if __name__ == "__main__":
+    main()
