@@ -111,7 +111,13 @@ class PccGymDriver():
 
         self.weights = arg_or_default("--weight_throughput", 0.6), arg_or_default("--weight_delay", 0.3), arg_or_default("--weight_loss", 0.1)
 
-        self.agent = loaded_agent.LoadedModelAgent(MODEL_PATH, self.weights)
+        print("Initialized MOCC driver with weights: " + str(self.weights))
+
+        model_path = "./model_" + str(self.weights[0]) + "_" + str(self.weights[1]) + "_" + str(self.weights[2])
+        
+        self.agent = loaded_agent.LoadedModelAgent(model_path, self.weights)
+        
+        print("Loaded model from " + model_path)
 
         PccGymDriver.flow_lookup[flow_id] = self
 
@@ -151,6 +157,7 @@ class PccGymDriver():
     def on_report(self, r):
         # 处理收到的数据
         recent_call = time.time()
+        print("-------------------------------")
         print("last call: ", self.last_call)
         print("recent call: ", recent_call)
         print("call interval: ", int((recent_call - self.last_call) * 1000000))
@@ -186,10 +193,12 @@ class PccGymDriver():
                 self.first_acked = False
                 self.first_ack_latency_sec = r['rtt_samples'] / 1000000
                 self.last_ack_latency_sec = self.first_ack_latency_sec
+                print("-------------------------------")
             else:
                 self.recv_end_time = time.time()
                 self.last_ack_latency_sec = r['rtt_samples'] / 1000000
                 print('update recv_end_time')
+                print("-------------------------------")
             return 0.0
 
 def main():
