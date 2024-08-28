@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # import inspect
-# import os
+import os
 import random
 import sys
 import socket
@@ -164,13 +164,13 @@ class PccGymDriver():
 
         if int(r['finish_interval']) == 1:
             print('update rate')
-            bytes_lost = self.datapath_info.mss * r['packets_lost']
+            bytes_lost = 1440 * r['packets_lost']
             bytes_sent = r['bytes_acked'] + r['bytes_sacked'] + bytes_lost + r['bytes_in_flight']
             utility = 0.0
             if self.recv_end_time == self.recv_start_time:
                 self.recv_end_time = time.time()
             rtt_samples = [self.first_ack_latency_sec, self.last_ack_latency_sec]
-            self.give_sample(bytes_sent, r['bytes_acked'], bytes_lost, self.send_start_time - self.start_flow_time, time.time() - self.start_flow_time, self.recv_start_time - self.start_flow_time, self.recv_end_time - self.start_flow_time, rtt_samples, self.datapath_info.mss, utility)
+            self.give_sample(bytes_sent, r['bytes_acked'], bytes_lost, self.send_start_time - self.start_flow_time, time.time() - self.start_flow_time, self.recv_start_time - self.start_flow_time, self.recv_end_time - self.start_flow_time, rtt_samples, 1440, utility)
             updated_rate = self.get_rate()
             self.send_start_time = time.time()
             self.first_acked = True
@@ -190,9 +190,15 @@ class PccGymDriver():
                 self.recv_end_time = time.time()
                 self.last_ack_latency_sec = r['rtt_samples'] / 1000000
                 print('update recv_end_time')
-            return None
+            return 0.0
 
 def main():
+    # Unix域套接字路径
+    socket_path = "/tmp/uds_socket"
+
+    # 确保套接字文件不存在
+    if os.path.exists(socket_path):
+        os.remove(socket_path)
     # 创建并绑定Unix域套接字
     server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_socket.bind("/tmp/uds_socket")
@@ -218,9 +224,8 @@ def main():
             result = driver.on_report(r)
             
             # 如果有返回值，将其发送回Rust进程
-            if result is not None:
-                response = json.dumps({"updated_rate": result})
-                conn.sendall(response.encode('utf-8'))
+            response = json.dumps({"updated_rate": result})
+            conn.sendall(response.encode('utf-8'))
         
     print("Connection closed.")
 
